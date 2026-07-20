@@ -1,0 +1,415 @@
+---
+title: "STATS 170 - Final Project"
+author: "AJ Fong - 006513485"
+date: "2026-06-07"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(astsa)
+library(xts)
+library(dplyr)
+library(vars)
+
+# SOURCE: https://www.stlouisfed.org/research/economists/mccracken/fred-databases
+```
+
+## PREPROCESSING
+
+```{r}
+#===============================================
+### PREPROCESSING FRED DATA ### 
+#===============================================
+# 1. Read raw data
+fred <- read.csv("fred_data.csv")
+
+# 2. Subset columns
+fred_data <- fred[, c("sasdate", "T10YFFM", "S.P.500", "CPIAUCSL", "UNRATE")]
+
+# Unemployment Rate produced by Chicago Fed for October 2025
+fred_data$UNRATE[802] <- 4.4
+# Source: https://www.reuters.com/world/us/us-unemployment-rate-rounds-up-44-october-chicago-fed-estimates-2025-11-06/
+
+# Calculate based off of the increase from September 2025 - November 2025 and 
+# adjusted for inflation
+fred_data$CPIAUCSL[802] <- 323.8
+
+# 3. Define transformation function
+transform_fred <- function(x, code) {
+  x <- as.numeric(x)
+  
+  if (code == 1) {
+    # Level (no transformation)
+    return(x)
+    
+  } else if (code == 2) {
+    # First difference
+    return(c(NA, diff(x)))
+    
+  } else if (code == 3) {
+    # Second difference
+    return(c(NA, NA, diff(x, differences = 2)))
+    
+  } else if (code == 4) {
+    # Log level
+    return(log(x))
+    
+  } else if (code == 5) {
+    # First difference of log
+    return(c(NA, diff(log(x))))
+    
+  } else if (code == 6) {
+    # Second difference of log
+    return(c(NA, NA, diff(log(x), differences = 2)))
+    
+  } else if (code == 7) {
+    # Difference of growth rate
+    return(c(NA, NA, diff(diff(log(x)))))
+    
+  } else {
+    warning(paste("Unknown transformation code:", code))
+    return(x)
+  }
+}
+
+# 4. Save dates and transformation codes from row 1
+dates <- fred_data[-1, 1]
+codes <- as.numeric(fred_data[1, -1])
+
+# 5. Remove the transformation-code row from data matrix
+fred_data <- fred_data[-1, ]
+
+# 6. Apply transformations to every variable
+fred_transformed <- as.data.frame(
+  Map(
+    transform_fred, 
+    fred_data[-1], 
+    codes
+  )
+)
+
+# 7. Restore names and bind dates
+names(fred_transformed) <- names(fred_data)[-1]
+
+fred_transformed <- cbind(
+  DATE = as.Date(dates, format = "%m/%d/%Y"), 
+  fred_transformed
+)
+
+# 8. Remove NA rows
+fred_transformed <- na.omit(fred_transformed)
+
+# 9. Select data after October 1, 2020
+fred_transformed <- fred_transformed[fred_transformed$DATE > as.Date("2020-10-01"), ]
+```
+
+## EDA
+
+```{r}
+#================================
+### EDA ###
+#================================
+layout(matrix(c(1, 2, 1, 3), 2, 2))
+tsplot(fred_transformed$T10YFFM, main = "10-Year Treasury Constant 
+       Maturity Minus Federal Funds Rate Differenced", ylab = "Value")
+acf(fred_transformed$T10YFFM)
+pacf(fred_transformed$T10YFFM)
+```
+
+```{r}
+layout(matrix(c(1, 2, 1, 3), 2, 2))
+tsplot(diff(fred_transformed$T10YFFM), main = "10-Year Treasury Constant 
+       Maturity Minus Federal Funds Rate Differenced Twice", ylab = "Value")
+acf(diff(fred_transformed$T10YFFM))
+pacf(diff(fred_transformed$T10YFFM))
+```
+
+
+```{r}
+layout(matrix(c(1, 2, 1, 3), 2, 2))
+tsplot(fred_transformed$S.P.500, main = "S&P 500 Price Differnced of Log", ylab = "Price")
+acf(fred_transformed$S.P.500)
+pacf(fred_transformed$S.P.500)
+```
+
+```{r}
+layout(matrix(c(1, 2, 1, 3), 2, 2))
+tsplot(fred_transformed$CPIAUCSL, main = "CPI for All Urban Consumers: All 
+       Items (Seasonally Adjusted) Differenced Twice", ylab = "Value")
+acf(fred_transformed$CPIAUCSL)
+pacf(fred_transformed$CPIAUCSL)
+```
+
+```{r}
+m1 <- lm(fred_transformed$CPIAUCSL ~ time(fred_transformed$DATE))
+plot(scale(m1$residuals), main = "Scaled Resdiual Plot of CPI", ylab = "Standard Deviation", lwd = 2)
+```
+
+
+```{r}
+layout(matrix(c(1, 2, 1, 3), 2, 2))
+tsplot(fred_transformed$UNRATE, main = "Unemployment Rate Differenced", ylab = "%")
+acf(fred_transformed$UNRATE)
+pacf(fred_transformed$UNRATE)
+```
+
+```{r}
+layout(matrix(c(1, 2, 1, 3), 2, 2))
+tsplot(diff(fred_transformed$UNRATE), main = "Unemployment Rate Differenced Twice", ylab = "%")
+acf(diff(fred_transformed$UNRATE))
+pacf(diff(fred_transformed$UNRATE))
+```
+
+```{r}
+#=========================================
+### TRANSFORMING VARIABLES ###
+#=========================================
+fred_transformed$T10YFFM <- c(NA, diff(fred_transformed$T10YFFM))
+fred_transformed$UNRATE <- c(NA, diff(fred_transformed$UNRATE))
+
+fred_transformed <- na.omit(fred_transformed)
+
+# Convert the cleaned data frame into an xts object
+fred_xts <- xts(
+  x = fred_transformed[, -1], 
+  order.by = fred_transformed$DATE
+)
+head(fred_xts)
+```
+
+
+## MODEL SELECTION
+
+```{r}
+# Restructuring Order for VAR: Real Economy - Prices - Policy - Markets
+var_input <- fred_transformed[, c("UNRATE", "CPIAUCSL", "T10YFFM", "S.P.500")]
+
+# Determine optimal lag length
+lag_selection <- VARselect(var_input, lag.max = 6, type = "const")
+
+# View the recommended lags
+print(lag_selection$selection)
+
+# Estimate the model
+var_model <- VAR(var_input, p = 2, type = "const")
+
+# View coefficients, R-squared, and p-values for each equation
+summary(var_model)
+
+# Test for serial correlation up to 12 months (Annual cycle)
+bg_test <- serial.test(var_model, lags.bg = 12, type = "BG")
+print(bg_test)
+```
+
+```{r}
+# Estimate the model
+var_model2 <- VAR(var_input, p = 1, type = "const")
+
+# View coefficients, R-squared, and p-values for each equation
+summary(var_model2)
+
+# Test for serial correlation up to 12 months (Annual cycle)
+bg_test <- serial.test(var_model2, lags.bg = 12, type = "BG")
+print(bg_test)
+```
+
+
+```{r}
+# Test if T10YFFM and S.P.500 jointly "Granger-cause" UNRATE
+granger_unrate <- causality(var_model2, cause = c("T10YFFM", "S.P.500"))
+print(granger_unrate)
+```
+
+```{r}
+# Test if T10YFFM and S.P.500 jointly "Granger-cause" UNRATE
+granger_unrate <- causality(var_model, cause = c("T10YFFM", "S.P.500"))
+print(granger_unrate)
+```
+
+
+## IRF SETUP
+
+```{r}
+# ==============================================================================
+# 1. The Monetary Policy Shock (FEDFUNDS)
+# ==============================================================================
+# Simulating an unexpected 1-percentage-point hike by the Fed
+irf_fed_shock <- irf(
+  var_model, 
+  impulse = "T10YFFM", 
+  response = c("UNRATE", "CPIAUCSL", "S.P.500"), 
+  n.ahead = 12, 
+  ortho = TRUE, 
+  boot = TRUE,      # Runs bootstrapping for confidence intervals
+  runs = 500,       # Number of bootstrap replications
+  ci = 0.95         # 95% confidence intervals
+)
+
+plot(irf_fed_shock, main = "Shock from T10YFFM")
+
+# ==============================================================================
+# 2. The Financial Market Shock (S.P.500)
+# ==============================================================================
+# Simulating an unexpected upward jump in stock returns
+irf_sp_shock <- irf(
+  var_model, 
+  impulse = "S.P.500", 
+  response = c("UNRATE", "CPIAUCSL", "T10YFFM"), 
+  n.ahead = 12, 
+  ortho = TRUE, 
+  boot = TRUE, 
+  runs = 500, 
+  ci = 0.95
+)
+
+plot(irf_sp_shock, main = "Shock from S.P.500")
+```
+
+
+## FORECASTING
+
+```{r}
+# Forecast based off of the VAR(2) model
+var_forecast <- predict(var_model, n.ahead = 12)
+# ==============================================================================
+# VARIABLE 1: UNRATE (Twice-Differenced Inversion & Plotting)
+# ==============================================================================
+# Clean historical data
+clean_unrate <- na.omit(as.numeric(fred_data$UNRATE))
+history_unrate_ts <- ts(clean_unrate, start = c(1959, 1), frequency = 12)
+
+# 1. Get historical anchors needed to invert two rounds of differencing
+last_unrate       <- tail(clean_unrate, 1)      
+last_diff1_unrate <- tail(diff(clean_unrate), 1)
+
+# 2. Reconstruct the first-difference forecasts
+fc_unrate_diff1       <- last_diff1_unrate + cumsum(var_forecast$fcst$UNRATE[, "fcst"])
+fc_unrate_diff1_lower <- last_diff1_unrate + cumsum(var_forecast$fcst$UNRATE[, "lower"])
+fc_unrate_diff1_upper <- last_diff1_unrate + cumsum(var_forecast$fcst$UNRATE[, "upper"])
+
+# 3. Reconstruct the raw percentage level forecasts
+actual_unrate_fcst  <- last_unrate + cumsum(fc_unrate_diff1)
+actual_unrate_lower <- last_unrate + cumsum(fc_unrate_diff1_lower)
+actual_unrate_upper <- last_unrate + cumsum(fc_unrate_diff1_upper)
+
+# 4. Synchronize time indices and attach last historical point to the forecast
+unrate_end <- time(history_unrate_ts)[length(history_unrate_ts)]
+unrate_fcst_ts  <- ts(c(last_unrate, actual_unrate_fcst),  start = unrate_end, frequency = 12)
+unrate_lower_ts <- ts(c(last_unrate, actual_unrate_lower), start = unrate_end, frequency = 12)
+unrate_upper_ts <- ts(c(last_unrate, actual_unrate_upper), start = unrate_end, frequency = 12)
+
+# 5. Generate the Plot
+plot(history_unrate_ts, type = "l", col = "black", lwd = 1.5, xlim = c(2022.2, 2027.2),
+     ylim = c(3, 5),
+     main = "Unemployment Rate (%)", xlab = "Year", ylab = "%")
+lines(unrate_fcst_ts, col = "blue", lwd = 2)
+lines(unrate_lower_ts, col = "red", lty = 2)
+lines(unrate_upper_ts, col = "red", lty = 2)
+
+# ==============================================================================
+# VARIABLE 2: T10YFFM (Twice-Differenced Inversion & Plotting)
+# ==============================================================================
+# 1. Clean historical data
+clean_fed <- na.omit(as.numeric(fred_data$T10YFFM))
+history_fed_ts <- ts(clean_fed, start = c(1959, 1), frequency = 12)
+
+# Get historical anchors needed to invert two rounds of differencing
+last_fed       <- tail(clean_fed, 1)
+last_diff1_fed <- tail(diff(clean_fed), 1)
+
+# 2. Reconstruct the first-difference forecasts
+fc_fed_diff1       <- last_diff1_fed + cumsum(var_forecast$fcst$T10YFFM[, "fcst"])
+fc_fed_diff1_lower <- last_diff1_fed + cumsum(var_forecast$fcst$T10YFFM[, "lower"])
+fc_fed_diff1_upper <- last_diff1_fed + cumsum(var_forecast$fcst$T10YFFM[, "upper"])
+
+# 3. Reconstruct the raw percentage level forecasts
+actual_fed_fcst  <- last_fed + cumsum(fc_fed_diff1)
+actual_fed_lower <- last_fed + cumsum(fc_fed_diff1_lower)
+actual_fed_upper <- last_fed + cumsum(fc_fed_diff1_upper)
+
+# 4. Synchronize time indices
+fed_end <- time(history_fed_ts)[length(history_fed_ts)]
+fed_fcst_ts  <- ts(c(last_fed, actual_fed_fcst),  start = fed_end, frequency = 12)
+fed_lower_ts <- ts(c(last_fed, actual_fed_lower), start = fed_end, frequency = 12)
+fed_upper_ts <- ts(c(last_fed, actual_fed_upper), start = fed_end, frequency = 12)
+
+# 5. Plot Federal Funds Rate Spread
+plot(history_fed_ts, type = "l", col = "black", lwd = 1.5, xlim = c(2022.2, 2027.2),
+     ylim = c(-2.5, 2.5),
+     main = "10-Year Treasury Constant \nMaturity Minus Federal Funds Rate", 
+     xlab = "Year", ylab = "%")
+lines(fed_fcst_ts, col = "blue", lwd = 2)
+lines(fed_lower_ts, col = "red", lty = 2)
+lines(fed_upper_ts, col = "red", lty = 2)
+# ==============================================================================
+# VARIABLE 3: CPIAUCSL (Second Log-Differenced Inversion & Plotting)
+# ==============================================================================
+# 1. Clean historical data
+clean_cpi <- na.omit(as.numeric(fred_data$CPIAUCSL))
+history_cpi_ts <- ts(clean_cpi, start = c(1959, 1), frequency = 12)
+
+# Get the two historical anchors needed for log-inversion
+last_cpi_level   <- tail(clean_cpi, 1)           
+last_log_cpi     <- log(last_cpi_level)          
+last_log_diff1   <- tail(diff(log(clean_cpi)), 1)
+
+# 2. Reconstruct the first log-difference forecasts
+fc_cpi_logdiff1       <- last_log_diff1 + cumsum(var_forecast$fcst$CPIAUCSL[, "fcst"])
+fc_cpi_logdiff1_lower <- last_log_diff1 + cumsum(var_forecast$fcst$CPIAUCSL[, "lower"])
+fc_cpi_logdiff1_upper <- last_log_diff1 + cumsum(var_forecast$fcst$CPIAUCSL[, "upper"])
+
+# 3. Reconstruct the log level forecasts 
+fc_cpi_log       <- last_log_cpi + cumsum(fc_cpi_logdiff1)
+fc_cpi_log_lower <- last_log_cpi + cumsum(fc_cpi_logdiff1_lower)
+fc_cpi_log_upper <- last_log_cpi + cumsum(fc_cpi_logdiff1_upper)
+
+# 4. Exponentiate log levels back to the raw index scale
+actual_cpi_fcst  <- exp(fc_cpi_log)
+actual_cpi_lower <- exp(fc_cpi_log_lower)
+actual_cpi_upper <- exp(fc_cpi_log_upper)
+
+# 5. Synchronize time indices
+cpi_end <- time(history_cpi_ts)[length(history_cpi_ts)]
+cpi_fcst_ts  <- ts(c(last_cpi_level, actual_cpi_fcst),  start = cpi_end, frequency = 12)
+cpi_lower_ts <- ts(c(last_cpi_level, actual_cpi_lower), start = cpi_end, frequency = 12)
+cpi_upper_ts <- ts(c(last_cpi_level, actual_cpi_upper), start = cpi_end, frequency = 12)
+
+# 6. Plot Consumer Price Index
+plot(history_cpi_ts, type = "l", col = "black", lwd = 1.5, xlim = c(2022.2, 2027.2),
+     ylim = c(280, 360),
+     main = "CPI: All Urban Consumers (Index)", xlab = "Year", ylab = "Index Level")
+lines(cpi_fcst_ts, col = "blue", lwd = 2)
+lines(cpi_lower_ts, col = "red", lty = 2)
+lines(cpi_upper_ts, col = "red", lty = 2)
+
+
+# ==============================================================================
+# VARIABLE 4: S.P.500 (Log-Differenced)
+# ==============================================================================
+# 1. Clean historical data
+clean_sp <- na.omit(as.numeric(fred_data$S.P.500))
+history_sp_ts <- ts(clean_sp, start = c(1959, 1), frequency = 12)
+last_sp <- tail(clean_sp, 1)
+
+# 2. Invert log-difference using exponential cumulative product
+actual_sp_fcst  <- last_sp * cumprod(exp(var_forecast$fcst$S.P.500[, "fcst"]))
+actual_sp_lower <- last_sp * cumprod(exp(var_forecast$fcst$S.P.500[, "lower"]))
+actual_sp_upper <- last_sp * cumprod(exp(var_forecast$fcst$S.P.500[, "upper"]))
+
+# 3. Synchronize time indices
+sp_end <- time(history_sp_ts)[length(history_sp_ts)]
+sp_fcst_ts  <- ts(c(last_sp, actual_sp_fcst),  start = sp_end, frequency = 12)
+sp_lower_ts <- ts(c(last_sp, actual_sp_lower), start = sp_end, frequency = 12)
+sp_upper_ts <- ts(c(last_sp, actual_sp_upper), start = sp_end, frequency = 12)
+
+# 4. Plot S&P 500 Index
+plot(history_sp_ts, type = "l", col = "black", lwd = 1.5, xlim = c(2022.2, 2027.2),
+     ylim = c(4000, 7700),
+     main = "S&P 500 Index Level", xlab = "Year", ylab = "Index Value")
+lines(sp_fcst_ts, col = "blue", lwd = 2)
+lines(sp_lower_ts, col = "red", lty = 2)
+lines(sp_upper_ts, col = "red", lty = 2)
+```
+
+
