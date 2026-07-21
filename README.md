@@ -1,4 +1,4 @@
-FRED Economic Data Modeling: A VAR Analysis of Macroeconomic and Financial Indicators
+# FRED Economic Data Modeling: A VAR Analysis of Macroeconomic and Financial Indicators
 
 This project uses a Vector Autoregression (VAR) model to explore the dynamic relationships between key U.S. macroeconomic and financial indicators, sourced from the Federal Reserve Economic Data (FRED) database. The goal is to understand how inflation, unemployment, interest rates, and equity markets influence one another over time, and to forecast their near-term trajectories.
 
